@@ -8,7 +8,7 @@
 - `TDXMonthBull_x86.def` / `TDXMonthBull_x64.def`: exports for 32-bit and 64-bit clients.
 - `build_x86.bat` / `build_x64.bat`: build with the matching Visual Studio Native Tools prompt.
 - `CON_月多_DLL.txt`: replacement daily formula.
-- `.github/workflows/build-windows-dll.yml`: Windows GitHub Actions workflow.
+- `.github/workflows/build-windows-dll.yml`: Windows GitHub Actions workflow, including an export-symbol check.
 
 ## Get both DLLs
 
