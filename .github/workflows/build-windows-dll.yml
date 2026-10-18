@@ -1,0 +1,79 @@
+name: Build TDXMonthBull Windows DLLs
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} DLL
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC, build, and verify export
+        shell: cmd
+        run: |
+          @echo off
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALLDIR=%%i"
+          if not defined VSINSTALLDIR (
+            echo ERROR: Visual Studio C++ Build Tools not found.
+            exit /b 10
+          )
+          call "%VSINSTALLDIR%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=${{ matrix.arch }}
+          if errorlevel 1 exit /b 11
+          call build_${{ matrix.arch }}.bat
+          if errorlevel 1 exit /b 12
+          if not exist dist\${{ matrix.arch }}\TDXMonthBull_${{ matrix.arch }}.dll exit /b 13
+          dumpbin /exports dist\${{ matrix.arch }}\TDXMonthBull_${{ matrix.arch }}.dll | findstr /C:"RegisterTdxFunc" >nul
+          if errorlevel 1 exit /b 14
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TDXMonthBull-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/TDXMonthBull_${{ matrix.arch }}.dll
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Package both DLL architectures
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download x86 and x64 DLLs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TDXMonthBull-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify and zip DLLs
+        shell: pwsh
+        run: |
+          $expected = @(
+            '.\dist\TDXMonthBull_x86.dll',
+            '.\dist\TDXMonthBull_x64.dll'
+          )
+          foreach ($file in $expected) {
+            if (!(Test-Path $file)) {
+              throw "Expected build artifact not found: $file"
+            }
+          }
+          Compress-Archive -Path '.\dist\TDXMonthBull_x86.dll', '.\dist\TDXMonthBull_x64.dll' -DestinationPath '.\TDXMonthBull_DLLs.zip' -Force
+
+      - name: Upload combined DLL package
+        uses: actions/upload-artifact@v4
+        with:
+          name: TDXMonthBull-x86-x64
+          path: TDXMonthBull_DLLs.zip
+          if-no-files-found: error
+          retention-days: 14
