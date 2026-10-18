@@ -36,6 +36,7 @@ constexpr int kDigits = 5;
 constexpr int kMonthlyMacdInfoId = 1;
 constexpr int kWeeklyMacdCrossId = 2;
 constexpr int kWeeklySarId = 3;
+constexpr int kDailyMacdId = 4;
 
 struct MacdResult {
     std::vector<double> dif;
@@ -43,19 +44,41 @@ struct MacdResult {
     std::vector<double> macd;
 };
 
+// 与 TdxFun.rd / rdArray 对齐：Math.round(N * 10^d) / 10^d。
+// Java Math.round(NaN) 返回 0；正负无穷及越界值饱和到 long 边界。
 inline double JavaRound(double value, int digits = kDigits) {
-    if (!std::isfinite(value)) return value;
     const double factor = std::pow(10.0, digits);
-    return std::floor(value * factor + 0.5) / factor;
+    if (std::isnan(value)) return 0.0;
+    const double scaled = value * factor;
+    const double maxLong = static_cast<double>(std::numeric_limits<long long>::max());
+    const double minLong = static_cast<double>(std::numeric_limits<long long>::min());
+    if (scaled >= maxLong) return static_cast<double>(std::numeric_limits<long long>::max()) / factor;
+    if (scaled <= minLong) return static_cast<double>(std::numeric_limits<long long>::min()) / factor;
+    return std::floor(scaled + 0.5) / factor;
 }
 
+// 与 TdxFun.EMA(double[], N) 一致：从第一个 finite 样本初始化；
+// 后续仅在当前输入与上一 EMA 均为 finite 时递推。
 std::vector<double> Ema(const std::vector<double>& input, int period) {
-    std::vector<double> out(input.size(), 0.0);
+    std::vector<double> out(input.size(), std::numeric_limits<double>::quiet_NaN());
     if (input.empty() || period <= 0) return out;
     const double alpha = 2.0 / (static_cast<double>(period) + 1.0);
-    out[0] = input[0];
-    for (std::size_t i = 1; i < input.size(); ++i) {
-        out[i] = alpha * input[i] + (1.0 - alpha) * out[i - 1];
+    std::size_t start = input.size();
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (std::isfinite(input[i])) {
+            start = i;
+            out[i] = input[i];
+            break;
+        }
+    }
+    if (start == input.size()) return out;
+    for (std::size_t i = start + 1; i < input.size(); ++i) {
+        const double value = input[i];
+        if (std::isfinite(value) && std::isfinite(out[i - 1])) {
+            out[i] = alpha * value + (1.0 - alpha) * out[i - 1];
+        } else {
+            out[i] = std::numeric_limits<double>::quiet_NaN();
+        }
     }
     return out;
 }
@@ -123,6 +146,7 @@ inline bool MonthlyMacdCross(const MacdResult& macd) {
 // DLL 函数 ID=1: MONTH_MACD_INFO(C, MONTH_START, MODE)
 // MODE 0=月线 DIF/DEA 绝对值比率，1=月线接近金叉，2=月线金叉判定，
 // 3=当月动态 MACD，4=当月动态 DIF，5=当月动态 DEA。
+// 月、周、日三种周期全部复用 CalcMacd -> TdxFun.MACD 的计算语义。
 void MonthMacdInfo(int dataLen, float* out, float* inC, float* inMonthStart, float* inMode) {
     if (out == nullptr || dataLen <= 0) return;
     std::fill(out, out + dataLen, 0.0f);
@@ -175,12 +199,48 @@ void WeekMacdCross(int dataLen, float* out, float* inC, float* inWeekStart, floa
     }
 }
 
-std::vector<double> CalcTdxSar(const std::vector<double>& high, const std::vector<double>& low) {
+// 逐行对应 TdxFun.TDX_SAR(high, low, iAFStep, iAFLimit)。
+// 默认调用语义固定为 TDX_SAR(high, low) -> TDX_SAR(high, low, 2, 20)。
+
+// DLL 函数 ID=4: DAILY_MACD(C, MODE, UNUSED)
+// MODE 0=DIF，1=DEA，2=MACD。
+// 严格复用 TdxFun.MACD(C) 的 (12,26,9) 参数和 5 位小数输出。
+void DailyMacd(int dataLen, float* out, float* inC, float* inMode, float* /*inUnused*/) {
+    if (out == nullptr || dataLen <= 0) return;
+    std::fill(out, out + dataLen, 0.0f);
+    if (inC == nullptr || inMode == nullptr) return;
+    try {
+        std::vector<double> close(static_cast<std::size_t>(dataLen));
+        for (int i = 0; i < dataLen; ++i) {
+            close[static_cast<std::size_t>(i)] = static_cast<double>(inC[i]);
+        }
+        const MacdResult macd = CalcMacd(close);
+        for (int i = 0; i < dataLen; ++i) {
+            const double rawMode = std::isfinite(inMode[i]) ? static_cast<double>(inMode[i]) : 0.0;
+            const int mode = static_cast<int>(std::floor(rawMode + 0.5));
+            const std::size_t index = static_cast<std::size_t>(i);
+            switch (mode) {
+                case 0: out[i] = static_cast<float>(macd.dif[index]); break;
+                case 1: out[i] = static_cast<float>(macd.dea[index]); break;
+                case 2: out[i] = static_cast<float>(macd.macd[index]); break;
+                default: out[i] = 0.0f; break;
+            }
+        }
+    } catch (...) {
+        std::fill(out, out + dataLen, 0.0f);
+    }
+}
+
+std::vector<double> CalcTdxSar(const std::vector<double>& high,
+                              const std::vector<double>& low,
+                              int iAFStep = 2,
+                              int iAFLimit = 20) {
+    // 公式调用时 high/low 等长；此处也防止 DLL 输入异常造成越界。
     const std::size_t n = std::min(high.size(), low.size());
     std::vector<double> sar(n, 0.0);
     if (n == 0) return sar;
-    constexpr double afStep = 0.02;
-    constexpr double afLimit = 0.20;
+    const double afStep = iAFStep / 100.0;
+    const double afLimit = iAFLimit / 100.0;
     bool bull = true;
     double af = afStep;
     double ep = high[0];
@@ -246,7 +306,7 @@ void WeekSar(int dataLen, float* out, float* inH, float* inL, float* inWeekStart
                 weekHigh.back() = std::max(weekHigh.back(), high);
                 weekLow.back() = std::min(weekLow.back(), low);
             }
-            const std::vector<double> sar = CalcTdxSar(weekHigh, weekLow);
+            const std::vector<double> sar = CalcTdxSar(weekHigh, weekLow, 2, 20);
             if (!sar.empty()) out[i] = static_cast<float>(sar.back());
         }
     } catch (...) {
@@ -259,6 +319,7 @@ PluginTCalcFuncInfo g_CalcFuncSets[] = {
     {kMonthlyMacdInfoId, reinterpret_cast<pPluginFUNC>(&MonthMacdInfo)},
     {kWeeklyMacdCrossId, reinterpret_cast<pPluginFUNC>(&WeekMacdCross)},
     {kWeeklySarId, reinterpret_cast<pPluginFUNC>(&WeekSar)},
+    {kDailyMacdId, reinterpret_cast<pPluginFUNC>(&DailyMacd)},
     {0, nullptr}
 };
 
