@@ -28,10 +28,11 @@ MACD_月金叉     : TDXDLL1(1, C, MONTH_START, 2) NODRAW;
 { 周线 MACD：每个交易日重算“截至当日”的动态周收盘价 }
 MACD_周金叉 : TDXDLL1(2, C, WEEK_START, 0) NODRAW;
 
-{ 日线条件保持日线计算，不再引用任何未来周/月数据 }
-MACD_D := MACD.MACD#DAY;
-DIF_D  := MACD.DIF#DAY;
-DEA_D  := MACD.DEA#DAY;
+{ 日线 MACD 也严格使用 TdxFun.MACD(12,26,9) 的 DLL 实现 }
+{ 内部函数4：MODE=0 DIF，MODE=1 DEA，MODE=2 MACD }
+DIF_D  := TDXDLL1(4,C,0,0);
+DEA_D  := TDXDLL1(4,C,1,0);
+MACD_D := TDXDLL1(4,C,2,0);
 MACD_日上0轴 : (DIF_D>=0 AND DEA_D>=0) || (MACD_D>=0 AND MACD_D=HHV(MACD_D,10)) NODRAW;
 
 MACD月多 := MACD_月金叉 AND MACD_周金叉 AND MACD_日上0轴;
