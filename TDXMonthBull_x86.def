@@ -1,0 +1,3 @@
+LIBRARY "TDXMonthBull_x86"
+EXPORTS
+    RegisterTdxFunc=_RegisterTdxFunc
