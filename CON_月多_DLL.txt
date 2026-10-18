@@ -1,0 +1,49 @@
+{ ===================================================================== }
+{ CON_月多 - DLL 动态周/月聚合修正版                                  }
+{ 适用：日 K 图。所有 #WEEK / #MONTH 指标引用已移除。                       }
+{ 将 DLL 绑定到“第1号DLL”：64位客户端绑定 TDXMonthBull_x64.dll，32位客户端绑定 TDXMonthBull_x86.dll。若绑定到其他槽位，将 TDXDLL1 改为对应的 TDXDLLn。 }
+{   TDXDLL1(1, C, MONTH_START, MODE)                                    }
+{   TDXDLL1(2, C, WEEK_START, 0)                                        }
+{   TDXDLL1(3, H, L, WEEK_START)                                        }
+{ DLL函数调用格式：TDXDLLn(内部函数编号, 参数1, 参数2, 参数3)；MODE: 0=比率；1=接近金叉；2=月金叉 }
+{ ===================================================================== }
+
+MA20 := MA(C,20);
+MA50 := IF(MA(C,50)=DRAWNULL, 0, MA(C,50));
+MA100:= IF(MA(C,100)=DRAWNULL, 0, MA(C,100));
+MA250:= IF(MA(C,250)=DRAWNULL, 0, MA(C,250));
+
+{ 该指标仍按日线计算；保留原来用户的日线预萌出定义 }
+均线预萌出 : 均线预萌出.均线预萌出#DAY NODRAW;
+
+{ 关键：只用日期字段构造周期边界，不引用周/月周期指标值 }
+WEEK_START  := IF(BARSCOUNT(C)=1, 1, WEEKDAY < REF(WEEKDAY,1));
+MONTH_START := IF(BARSCOUNT(C)=1, 1, MONTH <> REF(MONTH,1));
+
+{ 月线指标：DLL 按日更新当月动态收盘价；MODE=0/1/2 }
+MACD月_比率     := TDXDLL1(1, C, MONTH_START, 0) NODRAW;
+MACD月_接近金叉 : TDXDLL1(1, C, MONTH_START, 1) NODRAW;
+MACD_月金叉     : TDXDLL1(1, C, MONTH_START, 2) NODRAW;
+
+{ 周线 MACD：每个交易日重算“截至当日”的动态周收盘价 }
+MACD_周金叉 : TDXDLL1(2, C, WEEK_START, 0) NODRAW;
+
+{ 日线条件保持日线计算，不再引用任何未来周/月数据 }
+MACD_D := MACD.MACD#DAY;
+DIF_D  := MACD.DIF#DAY;
+DEA_D  := MACD.DEA#DAY;
+MACD_日上0轴 : (DIF_D>=0 AND DEA_D>=0) || (MACD_D>=0 AND MACD_D=HHV(MACD_D,10)) NODRAW;
+
+MACD月多 := MACD_月金叉 AND MACD_周金叉 AND MACD_日上0轴;
+MACD周多 := MACD_周金叉 AND MACD_日上0轴 AND (MACD_月金叉 || (MA250=0 AND C>MA20 AND MA20>MA50) || (C>MA100 AND C>MA250 AND (MA50>MA100 || MA50>MA250) AND (MA100>REF(MA100,1) || MA250>REF(MA250,1)))) NODRAW;
+
+{ 周 SAR：DLL 聚合本周 H/L，输出每日的动态周 SAR }
+SAR周   : TDXDLL1(3, H, L, WEEK_START) NODRAW;
+SAR周多 : C >= SAR周 NODRAW;
+
+CON_RPS := 1; { RPS一线红(95) || RPS双线红(90) || RPS三线红(85); 保留原占位配置 }
+
+月多中期 : CON_RPS AND MACD_月金叉 AND (ABS(MACD_周金叉) + ABS(MACD_日上0轴) + ABS(SAR周多 || 均线预萌出)) >= 2 COLORWHITE DOTLINE;
+
+周多 : MACD周多 AND (SAR周多 || 均线预萌出) AND CON_RPS COLORLIMAGENTA DOTLINE;
+月多 : MACD月多 AND (SAR周多 || 均线预萌出) AND CON_RPS COLORMAGENTA;
