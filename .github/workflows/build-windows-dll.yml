@@ -19,17 +19,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Configure MSVC, build, and verify export
+      - name: Configure Visual C++ environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Build and verify exported registration function
         shell: cmd
         run: |
-          @echo off
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALLDIR=%%i"
-          if not defined VSINSTALLDIR (
-            echo ERROR: Visual Studio C++ Build Tools not found.
-            exit /b 10
-          )
-          call "%VSINSTALLDIR%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=${{ matrix.arch }}
-          if errorlevel 1 exit /b 11
           call build_${{ matrix.arch }}.bat
           if errorlevel 1 exit /b 12
           if not exist dist\${{ matrix.arch }}\TDXMonthBull_${{ matrix.arch }}.dll exit /b 13
@@ -49,6 +46,9 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Download x86 and x64 DLLs
         uses: actions/download-artifact@v4
         with:
