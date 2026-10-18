@@ -5,7 +5,7 @@
 {   TDXDLL1(1, C, MONTH_START, MODE)                                    }
 {   TDXDLL1(2, C, WEEK_START, 0)                                        }
 {   TDXDLL1(3, H, L, WEEK_START)                                        }
-{ DLL函数调用格式：TDXDLLn(内部函数编号, 参数1, 参数2, 参数3)；MODE: 0=比率；1=接近金叉；2=月金叉 }
+{ DLL函数调用格式：TDXDLLn(内部函数编号, 参数1, 参数2, 参数3)；内部1=月MACD，2=周MACD，3=周SAR，4=日MACD }
 { ===================================================================== }
 
 MA20 := MA(C,20);
