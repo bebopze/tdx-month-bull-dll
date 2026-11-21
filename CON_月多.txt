@@ -1,0 +1,61 @@
+MA20 :=   MA(C,20);
+MA50 :=IF(MA(C, 50)=DRAWNULL, 0, MA(C, 50));
+MA100:=IF(MA(C,100)=DRAWNULL, 0, MA(C,100));
+MA250:=IF(MA(C,250)=DRAWNULL, 0, MA(C,250));
+
+
+
+均线预萌出 :  均线预萌出.均线预萌出#DAY       NODRAW;
+
+
+
+MACD   :=  MACD.MACD#DAY;
+
+MACD_M :=  MACD.MACD#MONTH;
+ DEA_M :=  MACD.DEA#MONTH;
+ DIF_M :=  MACD.DIF#MONTH;
+
+
+
+
+
+{ ----------------------------------------------------------------------------------------------- 月多（V6   -   2024-02-05） }
+
+{ MACD月多  -  月/周金叉  -  日上0轴 }
+MACD月_比率     :=  MIN(ABS(DEA_M), ABS(DIF_M)) / MAX(ABS(DEA_M), ABS(DIF_M))       NODRAW;
+MACD月_接近金叉 :   (BARSLASTCOUNT(DIF_M >= REF(DIF_M, 1 *20))>=1.2*20   AND   MACD月_比率>=0.9)   ||   (BARSLASTCOUNT(DIF_M > REF(DIF_M, 1 *20))>=1   AND   MACD月_比率>=0.95)       NODRAW;
+{MACD_月金叉    :   MACD_M>=0     ||     ( MACD_M = HHV(MACD_M, 9 *20)   AND   MACD月_接近金叉 )       NODRAW;}
+MACD_月金叉     :   MACD_M>=0     ||     ( MACD_M = HH_MACD(9)           AND   MACD月_接近金叉 )       NODRAW;
+
+
+MACD_周金叉  :   MACD.MACD#WEEK >= 0       NODRAW;
+
+
+MACD_日上0轴 :   (MACD.DIF>=0 AND MACD.DEA>=0)   ||   ({MACD.DIF>=0 AND}     MACD>=0 AND MACD=HHV(MACD,10))       NODRAW;
+
+
+MACD月多     :   MACD_月金叉  AND  MACD_周金叉   AND  MACD_日上0轴       NODRAW;
+MACD周多     :   MACD_周金叉  AND  MACD_日上0轴  AND  (MACD_月金叉  ||  (MA250=0 AND C>MA20 AND MA20>MA50)  ||  (C>MA100 AND C>MA250 AND (MA50>MA100 || MA50>MA250) AND (MA100>REF(MA100,1) || MA250>REF(MA250,1) )) )       NODRAW;
+
+
+
+{ SAR周多  -  C > SAR#周 }
+SAR周    :  SAR.SAR#WEEK            NODRAW;
+SAR周多  :  C >= SAR.SAR#WEEK       NODRAW;
+
+
+
+
+
+CON_RPS :=  1; {RPS一线红(95) || RPS双线红(90) || RPS三线红(85);}
+
+
+
+月多中期 :   CON_RPS  AND  MACD_月金叉     AND     ( ABS(MACD_周金叉) + ABS(MACD_日上0轴) + ABS(SAR周多||均线萌出) ) >= 2     COLORWHITE DOTLINE;
+
+
+
+
+
+周多     :   MACD周多 AND (SAR周多   ||   均线预萌出)   AND   CON_RPS       COLORLIMAGENTA DOTLINE;
+月多     :   MACD月多 AND (SAR周多   ||   均线预萌出)   AND   CON_RPS       COLORMAGENTA;
