@@ -1,55 +1,81 @@
-{ ===================================================================== }
-{ CON_月多 - DLL 动态周/月聚合版  v2  (2026-11-22)                      }
-{ 适用：日 K 图。所有 #WEEK / #MONTH 指标引用已移除。                     }
-{ 绑定：64位客户端 TDXMonthBull_x64.dll；32位客户端 TDXMonthBull_x86.dll }
-{ 若 DLL 绑定到其他槽位，把 TDXDLL1 改为对应的 TDXDLLn。                  }
-{                                                                       }
-{ 本版相对 v1 的关键修复：                                                }
-{   v1 用 WEEK_START := WEEKDAY < REF(WEEKDAY,1) 判断新周；一旦遇到        }
-{   “整周休市”（国庆 / 春节长假），长假后首个交易日无法被识别为新周，        }
-{   两个自然周被并成一根周 K，周线 MACD / SAR 序列整体偏移，              }
-{   导致长假之后的「月多」长期错位（实测 47.5 万个交易日中 2383 天不一致）。  }
-{   v2 改为把「日期键」传给 DLL，由 DLL 按真实交易日历（ISO 周：周一为周首、}
-{   跨年按 week-based-year）切分周/月，与 Java 参考实现完全一致。           }
-{ ===================================================================== }
+{ =========================================================================== }
+{ CON_月多 - DLL 动态周/月聚合版  V2  (2026-11-22)                               }
+{ 适用：日 K 图。所有 #WEEK / #MONTH 指标引用已移除。                               }
+{ 绑定：64位客户端 TDXMONTHBULL_X64.DLL；32位客户端 TDXMONTHBULL_X86.DLL           }
+{ 若 DLL 绑定到其他槽位，把 TDXDLL1 改为对应的 TDXDLLN。                            }
+{                                                                              }
+{ 本版相对 V1 的关键修复：                                                        }
+{   V1 用 WEEK_START := WEEKDAY < REF(WEEKDAY,1) 判断新周；一旦遇到               }
+{   “整周休市”（国庆 / 春节长假），长假后首个交易日无法被识别为新周，                    }
+{   两个自然周被并成一根周 K，周线 MACD / SAR 序列整体偏移，                          }
+{   导致长假之后的「月多」长期错位（实测 47.5 万个交易日中 2383 天不一致）。             }
+{   V2 改为把「日期键」传给 DLL，由 DLL 按真实交易日历（ISO 周：周一为周首、            }
+{   跨年按 WEEK-BASED-YEAR）切分周/月，与 JAVA 参考实现完全一致。                    }
+{ =========================================================================== }
 
-MA20 := MA(C,20);
-MA50 := IF(MA(C,50)=DRAWNULL, 0, MA(C,50));
-MA100:= IF(MA(C,100)=DRAWNULL, 0, MA(C,100));
-MA250:= IF(MA(C,250)=DRAWNULL, 0, MA(C,250));
+MA20 :=   MA(C,20);
+MA50 :=IF(MA(C, 50)=DRAWNULL, 0, MA(C, 50));
+MA100:=IF(MA(C,100)=DRAWNULL, 0, MA(C,100));
+MA250:=IF(MA(C,250)=DRAWNULL, 0, MA(C,250));
+
+
 
 { 该指标仍按日线计算；保留原来用户的日线预萌出定义 }
-均线预萌出 : 均线预萌出.均线预萌出#DAY NODRAW;
+均线预萌出 :   均线预萌出.均线预萌出#DAY     NODRAW;
 
-{ -------------------------------------------------------------- }
-{ 日期键：通达信 DATE 返回 YYMMDD(年-1900)，如 2024-11-19 -> 1241119 }
-{ 等价写法：DATE_KEY := (YEAR-1900)*10000 + MONTH*100 + DAY;          }
-{ 排查用：把下面一行改成 DATE_KEY : DATE; 可在地图上核对数值。          }
-{ -------------------------------------------------------------- }
-DATE_KEY := DATE;
+
+
+{ ------------------------------------------------------------------- }
+{ 日期键：通达信 DATE 返回 YYMMDD(年-1900)，如 2024-11-19 -> 1241119      }
+{ 等价写法：DATE_KEY := (YEAR-1900)*10000 + MONTH*100 + DAY;            }
+{ 排查用：把下面一行改成 DATE_KEY : DATE; 可在地图上核对数值。               }
+{ ------------------------------------------------------------------- }
+DATE_KEY :=  DATE     NODRAW;
+
+
 
 { 内部函数1：月线 MACD 派生量（MODE 0=比率，1=接近金叉，2=月金叉） }
+{
 MACD月_比率     := TDXDLL1(1, C, DATE_KEY, 0) NODRAW;
 MACD月_接近金叉 := TDXDLL1(1, C, DATE_KEY, 1) NODRAW;
+}
 MACD_月金叉     := TDXDLL1(1, C, DATE_KEY, 2) NODRAW;
+
+
 
 { 内部函数2：周线 MACD.MACD >= 0 }
 MACD_周金叉 : TDXDLL1(2, C, DATE_KEY, 0) NODRAW;
 
+
+
 { 内部函数4：日线 MACD  (MODE 0=DIF 1=DEA 2=MACD 3=日上0轴) }
-{ 直接用 MODE 3：判定在 DLL 内以 double 完成，避免平台层 HHV / float 相等比较的边界抖动 }
+{ 直接用 MODE 3：判定在 DLL 内以 DOUBLE 完成，避免平台层 HHV / FLOAT 相等比较的边界抖动 }
 MACD_日上0轴 : TDXDLL1(4, C, 3, 0) NODRAW;
 
-MACD月多 := MACD_月金叉 AND MACD_周金叉 AND MACD_日上0轴;
-MACD周多 := MACD_周金叉 AND MACD_日上0轴 AND (MACD_月金叉 OR (MA250=0 AND C>MA20 AND MA20>MA50) OR (C>MA100 AND C>MA250 AND (MA50>MA100 OR MA50>MA250) AND (MA100>REF(MA100,1) OR MA250>REF(MA250,1)))) NODRAW;
+
+
+MACD月多     :   MACD_月金叉  AND  MACD_周金叉   AND  MACD_日上0轴       NODRAW;
+MACD周多     :   MACD_周金叉  AND  MACD_日上0轴  AND  (MACD_月金叉  ||  (MA250=0 AND C>MA20 AND MA20>MA50)  ||  (C>MA100 AND C>MA250 AND (MA50>MA100 || MA50>MA250) AND (MA100>REF(MA100,1) || MA250>REF(MA250,1) )) )       NODRAW;
+
+
 
 { 内部函数3：周 SAR（DLL 聚合本周 H/L，输出每日的动态周 SAR） }
 SAR周   : TDXDLL1(3, H, L, DATE_KEY) NODRAW;
 SAR周多 : C >= SAR周 NODRAW;
 
+
+
+
+
 CON_RPS := 1; { RPS一线红(95) || RPS双线红(90) || RPS三线红(85); 保留原占位配置 }
+
+
 
 月多中期 : CON_RPS AND MACD_月金叉 AND (ABS(MACD_周金叉) + ABS(MACD_日上0轴) + ABS(SAR周多 OR 均线预萌出)) >= 2 COLORWHITE DOTLINE;
 
-周多 : MACD周多 AND (SAR周多 OR 均线预萌出) AND CON_RPS COLORLIMAGENTA DOTLINE;
-月多 : MACD月多 AND (SAR周多 OR 均线预萌出) AND CON_RPS COLORMAGENTA;
+
+
+
+
+周多 :   MACD周多 AND (SAR周多 OR 均线预萌出) AND CON_RPS COLORLIMAGENTA DOTLINE;
+月多 :   MACD月多 AND (SAR周多 OR 均线预萌出) AND CON_RPS COLORMAGENTA;
