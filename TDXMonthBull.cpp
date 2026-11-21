@@ -1,6 +1,21 @@
 // TDXMonthBull.cpp
 // 日线因果聚合版：只用截至每个交易日已知的 C/H/L 动态聚合周/月 K。
-// 计算语义以用户提供的 MonthlyBullSignal2.java 为基准。
+//
+// 计算语义基准（逐行对齐）：
+//   bebopze/tdx-quant  →  common/tdxfun/TdxFun.java        （EMA / MACD / TDX_SAR / HHV / rd）
+//                      →  common/tdxfun/MonthlyBullSignal2.java（月多 的动态周/月聚合与判定）
+//
+// 周期边界（本版核心修复）：
+//   旧版依赖公式里的 WEEK_START := WEEKDAY < REF(WEEKDAY,1)，遇到「整周休市」（国庆/春节长假）
+//   时无法识别新周，会把两个自然周合并成一根周K，导致周线 MACD / SAR 序列整体偏移，
+//   进而使「月多」在长假之后长期错位（实测 249 个真实序列 / 474692 个交易日中 2383 天不一致）。
+//   本版改为由 DLL 依据真实交易日历（ISO 周：周一为周首、跨年按 week-based-year）自行切分，
+//   与 Java 侧 WeekFields.ISO 完全一致；同时保留旧版 0/1 标志入参的兼容模式。
+//
+// 入参约定（第 2/3 个参数）：传入日期键 DATE_KEY，形如 YYMMDD（年 - 1900），
+// 例如 2024-11-19 → 1241119；通达信公式里用 (YEAR-1900)*10000 + MONTH*100 + DAY 生成。
+//   1) 若整个入参序列都是 0/1 → 视为旧版「周/月起始标志」模式（兼容老公式）；
+//   2) 否则 → 视为日期键模式（推荐，全部周期边界由 DLL 自行判定）。
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +38,9 @@ constexpr BOOL TRUE = 1;
 constexpr BOOL FALSE = 0;
 #endif
 
+// 通达信官方 PluginTCalcFunc.h 约定：回调函数为默认调用约定（cdecl），
+// 结构体 1 字节对齐，注册函数名 RegisterTdxFunc。此处保持一致，勿加 WINAPI。
+
 #pragma pack(push, 1)
 typedef void (*pPluginFUNC)(int, float*, float*, float*, float*);
 struct PluginTCalcFuncInfo {
@@ -38,6 +56,135 @@ constexpr int kWeeklyMacdCrossId = 2;
 constexpr int kWeeklySarId = 3;
 constexpr int kDailyMacdId = 4;
 
+// ===========================================================================
+// 日期工具：纯整数公历运算（Howard Hinnant days_from_civil），无时区/无依赖
+// ===========================================================================
+struct Ymd {
+    int y = 0;
+    int m = 0;
+    int d = 0;
+    bool valid = false;
+};
+
+inline bool IsLeap(int y) { return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0); }
+
+inline int DaysInMonth(int y, int m) {
+    static const int kDays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m == 2) return IsLeap(y) ? 29 : 28;
+    return kDays[m - 1];
+}
+
+// 1970-01-01 为第 0 天
+inline long long DaysFromCivil(int y, int m, int d) {
+    const long long yy = static_cast<long long>(y) - (m <= 2 ? 1 : 0);
+    const long long era = (yy >= 0 ? yy : yy - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
+    const unsigned doy = static_cast<unsigned>((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<long long>(doe) - 719468;
+}
+
+// 1=Mon ... 7=Sun
+inline int IsoWeekday(long long daysSinceEpoch) {
+    const long long r = ((daysSinceEpoch % 7) + 7 + 3) % 7; // 1970-01-01 为星期四
+    return static_cast<int>(r) + 1;
+}
+
+// ISO 周（周一起算 + week-based-year）：与 Java WeekFields.ISO 等价
+inline void IsoWeekKey(int y, int m, int d, int* outWeekYear, int* outWeek) {
+    const long long e = DaysFromCivil(y, m, d);
+    const int wd = IsoWeekday(e);
+    const long long thursday = e + (4 - wd); // 本周四决定所属年度
+    // 求该周四所在公历年
+    long long t = thursday;
+    int ty = 1970;
+    for (;;) {
+        const long long yearDays = IsLeap(ty) ? 366 : 365;
+        if (t >= yearDays) {
+            t -= yearDays;
+            ++ty;
+        } else if (t < 0) {
+            --ty;
+            t += IsLeap(ty) ? 366 : 365;
+        } else {
+            break;
+        }
+    }
+    const long long jan1 = DaysFromCivil(ty, 1, 1);
+    *outWeekYear = ty;
+    *outWeek = static_cast<int>((thursday - jan1) / 7) + 1;
+}
+
+// 解析日期键：支持 YYMMDD(年-1900，通达信 DATE 惯例) / YYMMDD(2000 起) / YYYYMMDD
+inline Ymd DecodeDateKey(float raw) {
+    Ymd out;
+    if (!std::isfinite(raw)) return out;
+    const long long n = static_cast<long long>(std::floor(static_cast<double>(raw) + 0.5));
+    if (n <= 0) return out;
+    long long ymd = n;
+    if (n >= 19000000LL) {          // YYYYMMDD（float32 精度有限，仅容错）
+        out.y = static_cast<int>(n / 10000);
+    } else if (n >= 500000LL) {     // YYMMDD，年 + 1900（通达信 DATE 惯例：1241119 → 2024-11-19）
+        out.y = 1900 + static_cast<int>(n / 10000);
+    } else {                        // YYMMDD，2000 起（如 241119）
+        out.y = 2000 + static_cast<int>(n / 10000);
+    }
+    out.m = static_cast<int>((ymd / 100) % 100);
+    out.d = static_cast<int>(ymd % 100);
+    if (out.m < 1 || out.m > 12 || out.d < 1 || out.d > DaysInMonth(out.y, out.m)) {
+        return Ymd{};
+    }
+    out.valid = true;
+    return out;
+}
+
+// 周期切分器：同一序列既要判断「新周」也要判断「新月」
+class PeriodSplitter {
+public:
+    PeriodSplitter(const float* keySeries, int dataLen) : series_(keySeries) {
+        for (int i = 0; i < dataLen; ++i) {
+            if (std::isfinite(series_[i]) && series_[i] > 1.5f) {
+                dateMode_ = true;
+                break;
+            }
+        }
+    }
+
+    bool DateMode() const { return dateMode_; }
+
+    bool NewWeek(int i) const {
+        if (i <= 0) return true;
+        if (!dateMode_) return Flag(series_[i]);
+        const Ymd cur = DecodeDateKey(series_[i]);
+        if (!cur.valid) return false; // 当日日期缺失：并入上一根，避免凭空造出新周
+        const Ymd prev = DecodeDateKey(series_[i - 1]);
+        if (!prev.valid) return true;
+        int wy1 = 0, wk1 = 0, wy0 = 0, wk0 = 0;
+        IsoWeekKey(cur.y, cur.m, cur.d, &wy1, &wk1);
+        IsoWeekKey(prev.y, prev.m, prev.d, &wy0, &wk0);
+        return wy1 != wy0 || wk1 != wk0;
+    }
+
+    bool NewMonth(int i) const {
+        if (i <= 0) return true;
+        if (!dateMode_) return Flag(series_[i]);
+        const Ymd cur = DecodeDateKey(series_[i]);
+        if (!cur.valid) return false;
+        const Ymd prev = DecodeDateKey(series_[i - 1]);
+        if (!prev.valid) return true;
+        return cur.y != prev.y || cur.m != prev.m;
+    }
+
+private:
+    static bool Flag(float v) { return std::isfinite(v) && v > 0.5f; }
+
+    const float* series_;
+    bool dateMode_ = false;
+};
+
+// ===========================================================================
+// TdxFun 对齐工具
+// ===========================================================================
 struct MacdResult {
     std::vector<double> dif;
     std::vector<double> dea;
@@ -103,10 +250,6 @@ MacdResult CalcMacd(const std::vector<double>& close) {
     return out;
 }
 
-inline bool FlagAt(const float* series, int i) {
-    return series != nullptr && std::isfinite(series[i]) && series[i] > 0.5f;
-}
-
 inline double MonthlyRatio(const MacdResult& macd) {
     if (macd.dif.empty() || macd.dea.empty()) return 0.0;
     const std::size_t last = macd.dif.size() - 1;
@@ -117,6 +260,7 @@ inline double MonthlyRatio(const MacdResult& macd) {
     return std::min(a, b) / mx;
 }
 
+// BARSLASTCOUNT(DIF_M >= REF(DIF_M,1)) 与 (DIF_M > REF(DIF_M,1))
 inline bool MonthlyNearCross(const MacdResult& macd) {
     const std::size_t n = macd.dif.size();
     if (n < 2) return false;
@@ -129,6 +273,7 @@ inline bool MonthlyNearCross(const MacdResult& macd) {
         else blc2 = 0;
     }
     const double ratio = MonthlyRatio(macd);
+    // Java 侧阈值：(int)(1.2 * 20) == 24
     return (blc1 >= 24 && ratio >= 0.9) || (blc2 >= 1 && ratio >= 0.95);
 }
 
@@ -137,26 +282,27 @@ inline bool MonthlyMacdCross(const MacdResult& macd) {
     if (n == 0) return false;
     const double current = macd.macd[n - 1];
     if (current >= 0.0) return true;
+    // Java: HHV(MACD_M,9) 在月数 < 9 时为 NaN → 等值比较恒为 false
     if (n < 9 || !MonthlyNearCross(macd)) return false;
     double hhv = -std::numeric_limits<double>::infinity();
     for (std::size_t i = n - 9; i < n; ++i) hhv = std::max(hhv, macd.macd[i]);
     return current == hhv;
 }
 
-// DLL 函数 ID=1: MONTH_MACD_INFO(C, MONTH_START, MODE)
+// DLL 函数 ID=1: MONTH_MACD_INFO(C, DATE_KEY, MODE)
 // MODE 0=月线 DIF/DEA 绝对值比率，1=月线接近金叉，2=月线金叉判定，
 // 3=当月动态 MACD，4=当月动态 DIF，5=当月动态 DEA。
-// 月、周、日三种周期全部复用 CalcMacd -> TdxFun.MACD 的计算语义。
-void MonthMacdInfo(int dataLen, float* out, float* inC, float* inMonthStart, float* inMode) {
+void MonthMacdInfo(int dataLen, float* out, float* inC, float* inKey, float* inMode) {
     if (out == nullptr || dataLen <= 0) return;
     std::fill(out, out + dataLen, 0.0f);
-    if (inC == nullptr || inMonthStart == nullptr || inMode == nullptr) return;
+    if (inC == nullptr || inKey == nullptr || inMode == nullptr) return;
     try {
+        const PeriodSplitter period(inKey, dataLen);
         std::vector<double> monthClose;
         monthClose.reserve(static_cast<std::size_t>(dataLen) / 20 + 2);
         for (int i = 0; i < dataLen; ++i) {
             const double close = std::isfinite(inC[i]) ? static_cast<double>(inC[i]) : 0.0;
-            if (monthClose.empty() || FlagAt(inMonthStart, i)) monthClose.push_back(close);
+            if (monthClose.empty() || period.NewMonth(i)) monthClose.push_back(close);
             else monthClose.back() = close;
             const MacdResult macd = CalcMacd(monthClose);
             if (macd.macd.empty()) continue;
@@ -179,17 +325,19 @@ void MonthMacdInfo(int dataLen, float* out, float* inC, float* inMonthStart, flo
     }
 }
 
-// DLL 函数 ID=2: WEEK_MACD_CROSS(C, WEEK_START, UNUSED)
-void WeekMacdCross(int dataLen, float* out, float* inC, float* inWeekStart, float* /*inUnused*/) {
+// DLL 函数 ID=2: WEEK_MACD_CROSS(C, DATE_KEY, UNUSED)
+// MACD.MACD#WEEK >= 0
+void WeekMacdCross(int dataLen, float* out, float* inC, float* inKey, float* /*inUnused*/) {
     if (out == nullptr || dataLen <= 0) return;
     std::fill(out, out + dataLen, 0.0f);
-    if (inC == nullptr || inWeekStart == nullptr) return;
+    if (inC == nullptr || inKey == nullptr) return;
     try {
+        const PeriodSplitter period(inKey, dataLen);
         std::vector<double> weekClose;
         weekClose.reserve(static_cast<std::size_t>(dataLen) / 5 + 2);
         for (int i = 0; i < dataLen; ++i) {
             const double close = std::isfinite(inC[i]) ? static_cast<double>(inC[i]) : 0.0;
-            if (weekClose.empty() || FlagAt(inWeekStart, i)) weekClose.push_back(close);
+            if (weekClose.empty() || period.NewWeek(i)) weekClose.push_back(close);
             else weekClose.back() = close;
             const MacdResult macd = CalcMacd(weekClose);
             if (!macd.macd.empty()) out[i] = macd.macd.back() >= 0.0 ? 1.0f : 0.0f;
@@ -201,41 +349,10 @@ void WeekMacdCross(int dataLen, float* out, float* inC, float* inWeekStart, floa
 
 // 逐行对应 TdxFun.TDX_SAR(high, low, iAFStep, iAFLimit)。
 // 默认调用语义固定为 TDX_SAR(high, low) -> TDX_SAR(high, low, 2, 20)。
-
-// DLL 函数 ID=4: DAILY_MACD(C, MODE, UNUSED)
-// MODE 0=DIF，1=DEA，2=MACD。
-// 严格复用 TdxFun.MACD(C) 的 (12,26,9) 参数和 5 位小数输出。
-void DailyMacd(int dataLen, float* out, float* inC, float* inMode, float* /*inUnused*/) {
-    if (out == nullptr || dataLen <= 0) return;
-    std::fill(out, out + dataLen, 0.0f);
-    if (inC == nullptr || inMode == nullptr) return;
-    try {
-        std::vector<double> close(static_cast<std::size_t>(dataLen));
-        for (int i = 0; i < dataLen; ++i) {
-            close[static_cast<std::size_t>(i)] = static_cast<double>(inC[i]);
-        }
-        const MacdResult macd = CalcMacd(close);
-        for (int i = 0; i < dataLen; ++i) {
-            const double rawMode = std::isfinite(inMode[i]) ? static_cast<double>(inMode[i]) : 0.0;
-            const int mode = static_cast<int>(std::floor(rawMode + 0.5));
-            const std::size_t index = static_cast<std::size_t>(i);
-            switch (mode) {
-                case 0: out[i] = static_cast<float>(macd.dif[index]); break;
-                case 1: out[i] = static_cast<float>(macd.dea[index]); break;
-                case 2: out[i] = static_cast<float>(macd.macd[index]); break;
-                default: out[i] = 0.0f; break;
-            }
-        }
-    } catch (...) {
-        std::fill(out, out + dataLen, 0.0f);
-    }
-}
-
 std::vector<double> CalcTdxSar(const std::vector<double>& high,
                               const std::vector<double>& low,
                               int iAFStep = 2,
                               int iAFLimit = 20) {
-    // 公式调用时 high/low 等长；此处也防止 DLL 输入异常造成越界。
     const std::size_t n = std::min(high.size(), low.size());
     std::vector<double> sar(n, 0.0);
     if (n == 0) return sar;
@@ -286,12 +403,13 @@ std::vector<double> CalcTdxSar(const std::vector<double>& high,
     return sar;
 }
 
-// DLL 函数 ID=3: WEEK_SAR(H, L, WEEK_START)
-void WeekSar(int dataLen, float* out, float* inH, float* inL, float* inWeekStart) {
+// DLL 函数 ID=3: WEEK_SAR(H, L, DATE_KEY)
+void WeekSar(int dataLen, float* out, float* inH, float* inL, float* inKey) {
     if (out == nullptr || dataLen <= 0) return;
     std::fill(out, out + dataLen, 0.0f);
-    if (inH == nullptr || inL == nullptr || inWeekStart == nullptr) return;
+    if (inH == nullptr || inL == nullptr || inKey == nullptr) return;
     try {
+        const PeriodSplitter period(inKey, dataLen);
         std::vector<double> weekHigh;
         std::vector<double> weekLow;
         weekHigh.reserve(static_cast<std::size_t>(dataLen) / 5 + 2);
@@ -299,7 +417,7 @@ void WeekSar(int dataLen, float* out, float* inH, float* inL, float* inWeekStart
         for (int i = 0; i < dataLen; ++i) {
             const double high = std::isfinite(inH[i]) ? static_cast<double>(inH[i]) : 0.0;
             const double low = std::isfinite(inL[i]) ? static_cast<double>(inL[i]) : 0.0;
-            if (weekHigh.empty() || FlagAt(inWeekStart, i)) {
+            if (weekHigh.empty() || period.NewWeek(i)) {
                 weekHigh.push_back(high);
                 weekLow.push_back(low);
             } else {
@@ -313,13 +431,74 @@ void WeekSar(int dataLen, float* out, float* inH, float* inL, float* inWeekStart
         std::fill(out, out + dataLen, 0.0f);
     }
 }
+
+// DLL 函数 ID=4: DAILY_MACD(C, MODE, UNUSED)
+// MODE 0=DIF，1=DEA，2=MACD（均按 TdxFun.rdArray(...,5) 保留 5 位小数），
+// MODE 3=MACD_日上0轴 判定结果（0/1）：
+//       (DIF>=0 AND DEA>=0) OR (MACD>=0 AND MACD=HHV(MACD,10))
+//       HHV 采用与 Java 参考实现一致的语义（不足 10 根时为 NaN → 该分支不成立），
+//       并且在 DLL 内部用 double 比较，避免平台层 HHV 差异与 float 相等比较带来的边界抖动。
+void DailyMacd(int dataLen, float* out, float* inC, float* inMode, float* /*inUnused*/) {
+    if (out == nullptr || dataLen <= 0) return;
+    std::fill(out, out + dataLen, 0.0f);
+    if (inC == nullptr || inMode == nullptr) return;
+    try {
+        std::vector<double> close(static_cast<std::size_t>(dataLen));
+        for (int i = 0; i < dataLen; ++i) {
+            close[static_cast<std::size_t>(i)] = static_cast<double>(inC[i]);
+        }
+        const MacdResult macd = CalcMacd(close);
+
+        bool needDayAbove0 = false;
+        for (int i = 0; i < dataLen; ++i) {
+            const double rawMode = std::isfinite(inMode[i]) ? static_cast<double>(inMode[i]) : 0.0;
+            if (static_cast<int>(std::floor(rawMode + 0.5)) == 3) {
+                needDayAbove0 = true;
+                break;
+            }
+        }
+        std::vector<unsigned char> dayAbove0;
+        if (needDayAbove0) {
+            dayAbove0.assign(static_cast<std::size_t>(dataLen), 0);
+            for (int i = 0; i < dataLen; ++i) {
+                const bool aboveZeroAxis = (macd.dif[i] >= 0.0 && macd.dea[i] >= 0.0);
+                bool atWindowHigh = false;
+                if (i >= 9) {
+                    double hhv = -std::numeric_limits<double>::infinity();
+                    for (int j = i - 9; j <= i; ++j) hhv = std::max(hhv, macd.macd[j]);
+                    atWindowHigh = (macd.macd[i] >= 0.0 && macd.macd[i] == hhv);
+                }
+                dayAbove0[i] = (aboveZeroAxis || atWindowHigh) ? 1 : 0;
+            }
+        }
+
+        for (int i = 0; i < dataLen; ++i) {
+            const double rawMode = std::isfinite(inMode[i]) ? static_cast<double>(inMode[i]) : 0.0;
+            const int mode = static_cast<int>(std::floor(rawMode + 0.5));
+            const std::size_t index = static_cast<std::size_t>(i);
+            switch (mode) {
+                case 0: out[i] = static_cast<float>(macd.dif[index]); break;
+                case 1: out[i] = static_cast<float>(macd.dea[index]); break;
+                case 2: out[i] = static_cast<float>(macd.macd[index]); break;
+                case 3: out[i] = needDayAbove0 ? static_cast<float>(dayAbove0[index]) : 0.0f; break;
+                default: out[i] = 0.0f; break;
+            }
+        }
+    } catch (...) {
+        std::fill(out, out + dataLen, 0.0f);
+    }
+}
 } // namespace
 
+// ---------------------------------------------------------------------------
+// 通达信 DLL 导出表（单元测试 harness 通过定义 TDX_MONTHBULL_TEST_NO_EXPORTS 屏蔽）
+// ---------------------------------------------------------------------------
+#ifndef TDX_MONTHBULL_TEST_NO_EXPORTS
 PluginTCalcFuncInfo g_CalcFuncSets[] = {
-    {kMonthlyMacdInfoId, reinterpret_cast<pPluginFUNC>(&MonthMacdInfo)},
-    {kWeeklyMacdCrossId, reinterpret_cast<pPluginFUNC>(&WeekMacdCross)},
-    {kWeeklySarId, reinterpret_cast<pPluginFUNC>(&WeekSar)},
-    {kDailyMacdId, reinterpret_cast<pPluginFUNC>(&DailyMacd)},
+    {kMonthlyMacdInfoId, &MonthMacdInfo},
+    {kWeeklyMacdCrossId, &WeekMacdCross},
+    {kWeeklySarId, &WeekSar},
+    {kDailyMacdId, &DailyMacd},
     {0, nullptr}
 };
 
@@ -331,3 +510,4 @@ extern "C" BOOL RegisterTdxFunc(PluginTCalcFuncInfo** pFun) {
     }
     return FALSE;
 }
+#endif // TDX_MONTHBULL_TEST_NO_EXPORTS

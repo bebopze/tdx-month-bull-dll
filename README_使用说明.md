@@ -1,48 +1,155 @@
-# 通达信 CON_月多：Java 对齐版 DLL
+# 通达信 CON_月多：Java 对齐版 DLL（v2）
 
-## 1. 修复目标
+## 0. 结论先说
 
-这版对照 bebopze/tdx-quant 仓库中的 TdxFun.java 实现计算对齐：
+旧版 DLL 有一个会**长期污染信号**的 bug：周/月周期切分依赖公式传入的 `WEEK_START` 标志，
+而该标志的判定式 `WEEKDAY < REF(WEEKDAY,1)` 在**整周休市**（国庆、春节长假）之后必然漏判新周，
+于是两个自然周被并成一根周 K，周线 `MACD` / `SAR` 序列整体偏移且**不可自愈**。
 
-- MACD：严格按 TdxFun.MACD(close) 默认参数 (12, 26, 9)，分别调用 EMA(close,12)、EMA(close,26)，计算 DIF 原始值，再用 EMA(DIF,9) 计算 DEA，MACD=(DIF-DEA)*2。DIF/DEA/MACD 只在返回序列时按 rdArray(...,5) 规则保留 5 位小数。
-- EMA：按 TdxFun.EMA(double[],N) 实现，从第一个 finite 样本初始化，并按 Java 的 finite 规则递推。
-- SAR：按 TdxFun.TDX_SAR(high,low,2,20) 的状态机实现，包括初始多头状态、EP/AF 更新、SAR 修正、反转条件及反转后的 SAR 赋值。
-- 日线、周线、月线 MACD 都由 DLL 内部同一套 CalcMacd 实现计算；日线公式不再混用通达信内置 MACD 与 Java MACD。
-- 周 SAR 对截至当天的数据聚合周 HIGH/LOW，再调用同一 CalcTdxSar(...,2,20) 算法。
+v2 把周期切分搬进 DLL（按真实交易日历 = ISO 周，与 Java `WeekFields.ISO` 完全一致），
+并用本地 `tdx` 库中的**全量真实 K 线 + 已算好的 `ext_data`（月多）**做逐日回归：
 
-## 2. 编译产物
+| 对比 | 序列 | 交易日 | 与 Java/ext_data 不一致 |
+|---|---:|---:|---:|
+| Java 参考实现 vs ext_data（校验参考实现本身） | 249 | 474,692 | **0** |
+| **v2 DLL（本版）** vs Java | 249 | 474,692 | **0** |
+| v1 DLL（旧版，WEEK_START 标志） vs Java | 249 | 474,692 | **2,383**（0.50%） |
 
-- 64 位：dist\x64\TDXMonthBull_x64.dll
-- 32 位：dist\x86\TDXMonthBull_x86.dll
+旧版 249 个标的中有 **204 个**至少错 1 天，单标的最高错 65 天（`605222`）。
 
-使用 Windows GitHub Actions workflow 自动构建。成功后从 Actions artifact 下载最新 DLL。
+## 1. 问题定位（为什么"部分结果明显不对"）
 
-## 3. 内部函数编号与公式
+旧公式：
 
-假设绑定到通达信第 1 号 DLL：
+```
+WEEK_START  := IF(BARSCOUNT(C)=1, 1, WEEKDAY < REF(WEEKDAY,1));
+MONTH_START := IF(BARSCOUNT(C)=1, 1, MONTH <> REF(MONTH,1));
+```
 
-| 内部函数编号 | 调用形式 | 说明 |
+`MONTH` 的判定是对的，但 `WEEKDAY` 只能判断"星期几变小"，无法识别**跨过整周休市**的周边界：
+
+- 2017 年国庆：最后一个交易日 09-30（周五，WEEKDAY=5），节后首个交易日 10-09（周一，WEEKDAY=1）→ `1 < 5` 可以识别；
+- 2024 年国庆：09-30（周一，WEEKDAY=1）→ 10-08（周二，WEEKDAY=2）→ `2 < 1` 不成立 → **漏判新周**；
+- 2025 年春节：01-27（周一）→ 02-05（周三）→ 漏判。
+
+漏判后，两周的日线被合并成一根周 K（high/low 取并集、close 取后一周的收盘），
+周线序列就此永久少一根，后续所有周线 `MACD(12,26,9)` 与 `TDX_SAR(2,20)` 的值全部偏移，
+直到某个恰好把信号"拉回"的偶然行情才会再次对齐——表现为**长假之后月多信号连续多日对不上**。
+
+实测复现点：
+
+- `000001`（平安银行）首个差异 2017-03-20；
+- `688981`（中芯国际）自 2024-10-08（国庆后首日）起连续错位，到 2025-01 仍在对不上；
+- `601988` / `600036` / `601318` / `600030` / `603382` 等在长假后均有成串差异。
+
+## 2. v2 修复内容
+
+1. **周期切分移入 DLL**：新增日期键入参，DLL 内部按公历推算 ISO 周
+   （周一为周首、跨年按 week-based-year）和自然月，与 Java `WeekFields.ISO` / `YearMonth` 完全一致。
+   这样既不依赖 `WEEKDAY`，也不受长假、停牌、上市首日影响。
+2. **公式改为传日期键**：`DATE_KEY := DATE`（通达信 `DATE` 返回 YYMMDD(年-1900)，如 2024-11-19 → 1241119）。
+3. **新增内部函数 4 的 `MODE=3`**：`MACD_日上0轴` 直接在 DLL 内用 double 判定
+   （`(DIF>=0 AND DEA>=0) OR (MACD>=0 AND MACD=HHV(MACD,10))`，含"不足 10 根"的 Java 语义），
+   避免平台层 `HHV` 与 float 相等比较带来的边界抖动。
+4. **向后兼容**：若第 2 个入参整列都是 0/1，DLL 自动按旧版「周/月起始标志」模式工作，
+   旧公式仍可运行（但旧公式的周边界 bug 依旧存在，建议换新公式）。
+5. **其余算法不动**：`EMA` 初始化/递推、`MACD(12,26,9)`、输出 5 位小数（`rdArray(...,5)`）、
+   `TDX_SAR(2,20)` 状态机、`BARSLASTCOUNT`/`HHV` 语义逐行保持与 `TdxFun.java` 一致。
+
+### 关于 `1*20` / `9*20` 的口径（重要）
+
+原公式里写作 `BARSLASTCOUNT(DIF_M >= REF(DIF_M,1*20))`、`HHV(MACD_M,9*20)`。
+
+- 若**在通达信原生日线图上直译**：`DIF_M` 是"月线值按日对齐"的阶梯序列，`REF(DIF_M,20)` 就是
+  **20 个交易日**前，`BARSLASTCOUNT(...,) >= 24` 就是"连续 24 个交易日"，`HHV(MACD_M,180)` 是"180 日新高"。
+- Java 参考实现（`MonthlyBullSignal2.java`）的口径不同：它在**月 K 序列**上做 `REF(...,1)`、
+  `BARSLASTCOUNT >= 24`、`HHV(...,9)`，即"1 个月 / 连续 24 个月 / 9 个月新高"。
+
+库里的 `ext_data[月多]` 就是按**后一种（Java）口径**算出来的，本 DLL 与之完全一致，
+本轮 474,692 个交易日的回归也是按这个基准做的。
+两种口径的结论差别很大，请以 `ext_data` / Java 版本为准（本项目即按此对齐）。
+
+## 3. 内部函数编号与公式（v2）
+
+| 编号 | 调用形式 | 说明 |
 |---:|---|---|
-| 1 | TDXDLL1(1,C,MONTH_START,MODE) | 月线动态 MACD；MODE 0=比率，1=接近金叉，2=月金叉，3/4/5=MACD/DIF/DEA |
-| 2 | TDXDLL1(2,C,WEEK_START,0) | 周线动态 MACD 是否大于等于零轴 |
-| 3 | TDXDLL1(3,H,L,WEEK_START) | 周线动态 SAR，按 TDX_SAR(2,20) |
-| 4 | TDXDLL1(4,C,MODE,0) | 日线 Java MACD；MODE 0=DIF，1=DEA，2=MACD |
+| 1 | `TDXDLL1(1,C,DATE_KEY,MODE)` | 月线动态 MACD：MODE 0=比率，1=接近金叉，2=月金叉，3/4/5=MACD/DIF/DEA |
+| 2 | `TDXDLL1(2,C,DATE_KEY,0)` | 周线动态 MACD 是否 ≥ 0（周金叉） |
+| 3 | `TDXDLL1(3,H,L,DATE_KEY)` | 周线动态 SAR，按 `TDX_SAR(2,20)` |
+| 4 | `TDXDLL1(4,C,MODE,0)` | 日线 MACD：MODE 0=DIF，1=DEA，2=MACD，3=MACD_日上0轴（0/1） |
 
-若 DLL 绑定到其他槽位，把公式中的 TDXDLL1 改为对应的 TDXDLLn。
+配套公式见 [`CON_月多_DLL.txt`](CON_月多_DLL.txt)。若 DLL 绑定到其他槽位，把 `TDXDLL1` 改成对应的 `TDXDLLn`。
 
-## 4. 编译与安装
+## 4. 安装（DLL 与公式必须一起更新）
 
-需要 Visual Studio 2022 或 C++ Build Tools 以及 MSVC x86/x64 工具。
+1. 打开 **Actions → Build TDXMonthBull Windows DLLs**，下载最新 `TDXMonthBull-x86-x64` artifact（保留 14 天）。
+2. 64 位客户端绑定 `TDXMonthBull_x64.dll`，32 位客户端绑定 `TDXMonthBull_x86.dll`，不要交叉绑定。
+3. **用 [`CON_月多_DLL.txt`](CON_月多_DLL.txt) 替换旧公式**（旧公式仍能跑，但周边界 bug 还在）。
+4. 载入后先确认 `DATE_KEY` 数值正常：临时加一行 `DATE_KEY : DATE;`（去掉 NODRAW），
+   十字光标应显示 `1241119` 这类 7 位数字（2024-11-19）。
 
-- x64：打开“x64 Native Tools Command Prompt for VS 2022”，运行 build_x64.bat。
-- x86：打开“x86 Native Tools Command Prompt for VS 2022”，运行 build_x86.bat。
+## 5. 验证方法与结果（真实数据、逐日）
 
-32 位通达信只能绑定 x86 DLL；64 位通达信只能绑定 x64 DLL。
+### 5.1 数据
 
-## 5. 必须知道的精度边界
+本地 MySQL `tdx` 库：
 
-算法按 Java 实现翻译，但通达信 DLL 的系列接口使用 float* 输入/输出，而 Java TdxFun 使用 double[]。因此所有算法步骤、EMA 初始化、MACD 参数和 SAR 状态机按 Java 对齐，但 DLL ABI 的单精度输入/输出意味着无法承诺每个中间数值与 Java double 结果 bitwise 完全一致。常规行情下应通过逐日输出比对验证差异。
+- `base_stock.kline_his` / `base_block.kline_his`：全量真实日 K（zstd 压缩的 JSON）；
+- `base_stock.ext_data_his` / `base_block.ext_data_his`：已计算好的扩展数据，
+  按 `ExtDataDTO` 字段顺序，第 98 个字段 = **月多**、第 99 个 = 均线预萌出。
 
-## 6. 历史数据无未来函数验证
+抽样：183 只个股（A 股 / 创业板 / 科创板 / 北交所 / 港股 / ETF）+ 66 个板块（概念 / 行业），
+合计 **249 个序列、474,692 个交易日**。
 
-DLL 按日线顺序动态聚合周/月K，计算每一天时只使用截至该日的日线输入。仍应在真实通达信客户端测试 DLL 加载、公式语法、日期边界和逐日输出。
+### 5.2 三方实现
+
+| 实现 | 来源 |
+|---|---|
+| Java（基准） | 原样拷贝 `TdxFun.java` + `MonthlyBullSignal2.java`（仅把外部指标 `均线预萌出` 改为从 `ext_data` 注入），`javac` 编译运行 |
+| C++（DLL） | 直接 `#include TDXMonthBull.cpp`，按 `CON_月多_DLL.txt` 逐行复现公式层，以 **float32** 入参调用 4 个 DLL 函数 |
+| ground truth | `ext_data_his` 里已算好的 月多 |
+
+### 5.3 结果
+
+- Java 参考实现 vs `ext_data`：**0 差异**（先证明参考实现与库里的历史结果完全一致）；
+- **v2 DLL vs Java：0 差异**（474,692 个交易日逐日比对）；
+- v1 DLL vs Java：2,383 天差异，全部落在长假之后（详见 `verify/` 可复现）；
+- `MODE=3`（DLL 内判定日上0轴）与公式层用 `TDIF/DEA/MACD + HHV` 自行判定的结果一致。
+
+复现方式见 [`verify/README.md`](verify/README.md)。
+
+## 6. 精度与使用边界
+
+1. **float32 ABI**：通达信 DLL 系列接口是 `float*`，Java 是 `double[]`。价位/中间量在 1e-7 量级上的
+   差异，只有当 `C` 恰好与 `SAR`、`MA` 等几乎相等时才会翻转比较结果；
+   `月多` 的复合判断（比率、接近金叉、月/周金叉、日上0轴）已在 DLL 内用 double 完成，
+   只有 `C >= SAR周`、`C > MA20` 这类平台层比较仍受 float32 影响。
+2. **载入历史长度**：EMA 从"载入序列的第一根"起算，因此通达信实际载入多少历史会影响早期信号。
+   以 `000001` 为例（与全历史结果相比）：
+   | 载入日线数 | 差异占比 |
+   |---:|---:|
+   | 250 | 10.0% |
+   | 500 | 10.6% |
+   | 750 | 9.1% |
+   | 1200 | 1.8% |
+   | 2000 | 3.5% |
+
+   最近 5 个交易日均与全历史一致。**建议不要限制日线载入长度**（通达信默认载入全部历史最好）。
+   该敏感性对 Java 与 DLL 完全相同，不是 DLL 引入的误差。
+3. **均线预萌出**：来自独立指标 `均线预萌出.均线预萌出#DAY`，不在 DLL 计算范围内；
+   本项目的验证用 `ext_data` 中的该字段作为输入，因此不影响"月多"归因。
+4. **首 9 根 K 线**：`HHV(MACD,10)` 在不足 10 根时的语义，通达信取"已有窗口最大值"、
+   Java 实现返回 `NaN`（条件不成立）。v2 用 `MODE=3` 按 Java 语义在 DLL 内判定，
+   因此图形最左侧 9 根可能比"纯公式写法"少几个信号——与 Java 基准一致。
+5. **一个交易日都没有的周/月**：按 ISO 周/自然月直接跳过，不生成空 K，与 Java 一致。
+
+## 7. 历史数据无未来函数
+
+DLL 按日线顺序计算，第 i 天只使用 `0..i` 的输入（周/月 K 的最后一根是"截至当天"的动态聚合），
+不存在引用未来数据；月多信号在收盘后即固定，不随后续行情变化。
+
+## 8. 变更记录
+
+- **v2 (2026-11-22)**：周期切分改为 DLL 内按 `DATE` 计算（ISO 周）；新增函数 4 `MODE=3`；
+  公式改传 `DATE_KEY`；用 249 个真实序列、474,692 个交易日逐日回归，差异归零。
+- v1：按 `TdxFun.java` 对齐 EMA/MACD/SAR，但周期切分依赖公式 `WEEK_START` 标志（存在长假漏判 bug）。
